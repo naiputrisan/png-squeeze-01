@@ -460,7 +460,11 @@ interface Screened {
 }
 
 // Screen every form and filter choice at zlib level 6 and keep the smallest
-// (first on a tie). The winner's filtered bytes are then re-encoded at
+// (first on a tie). Level 6 is a deliberate cheap proxy, not the final
+// encoding: the winner's filtered bytes are re-encoded at level 9 (and by
+// the optimal parser when the stream is large enough) by the caller, so
+// screening only has to rank the forms and filter choices, not produce the
+// bytes that ship. The winner's filtered bytes are then re-encoded at
 // level 9 by the caller.
 function screen(rgba: Uint8Array, width: number, height: number): Screened {
   let best: Screened | null = null;
