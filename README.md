@@ -9,10 +9,10 @@ A lossless PNG compressor that squeezes 1280×720 screenshots into the smallest 
 ## How it squeezes
 
 - **Colour-type reduction.** Flat screenshots (at most 256 colours) become palettes, grey screenshots become grey, opaque screenshots drop the alpha channel, and a single transparent value is carried by a `tRNS` chunk instead of an alpha channel. Palette order is tried by count and by luminance, transparent entries first so `tRNS` stays short.
-- **Per-row filter search.** Every form is tried with fixed filters, the minimum-sum heuristic, the fewest-distinct-pairs heuristic, and a brute-force search that weighs each row's five filters by a zlib run over the row with the previous 32 KiB as its dictionary. Each candidate is weighed by zlib level 6 and the smallest wins.
-- **Optimal-parsing DEFLATE.** The winning filtered bytes are re-encoded by a from-scratch DEFLATE encoder (`deflate.ts`): hash-chain LZ77 match search, a shortest-path parse under a Huffman cost model seeded by a greedy parse, and one dynamic-Huffman block. It runs only when the platform zlib level-9 stream is at least 30,000 bytes — on smaller streams it matches zlib within a few bytes while costing seconds. The smaller of the optimal stream and the two zlib level-9 streams (filtered and default strategies) is written, so the encoder never loses to plain zlib.
+- **Per-row filter search.** Every form is tried with filter 0 throughout, the minimum-sum heuristic, and a brute-force search that weighs each row's five filters by a zlib run over the row with the previous 32 KiB as its dictionary. Candidates are ranked by zlib level 6 on a 180-row prefix, and the three best are re-scored on the full stream before the winner is chosen.
+- **Match-cache DEFLATE.** The winning filtered bytes are re-encoded by a from-scratch DEFLATE encoder (`deflate3.ts`) in the style of Zopfli: a hash-chain walk first builds, for every position, the Pareto frontier of (match length, closest distance) pairs; a shortest-path parse over that cache then chooses literals and matches under a Huffman cost model, and the token stream is split into blocks wherever a fresh Huffman tree pays for its header. Effort is tiered by stream size, and a wall-clock guard — the program's only clock read — downgrades or skips the strong encoder if a run is behind schedule, so a slow machine degrades to plain zlib instead of timing out. The smaller of the strong stream and the zlib level-9 filtered stream is written, so the encoder never loses to plain zlib.
 
-Only Node's built-in modules are used, there is no network access, and the program never reads the clock or the environment for decisions, so two runs on the same set write byte-identical files. The whole set of 8 screenshots runs in about 33 seconds on one CPU, inside the 60-second wall budget.
+Only Node's built-in modules are used and there is no network access. The whole set of 8 screenshots runs in about 54 seconds on one CPU, inside the 60-second wall budget.
 
 ## Practice-set results
 
@@ -20,16 +20,16 @@ Scored with the kit's own scorer on the practice set (score 0–1,000,000):
 
 | instance | theme | bytes | points (×1000) |
 | --- | --- | --- | --- |
-| i001 | flat | 12,496 | 718,370 |
-| i002 | rich | 51,265 | 712,646 |
-| i003 | alpha | 103,508 | 693,755 |
-| i004 | grey | 101,663 | 720,096 |
-| i005 | flat | 16,552 | 742,251 |
-| i006 | rich | 176,199 | 699,392 |
+| i001 | flat | 11,290 | 777,718 |
+| i002 | rich | 48,572 | 745,251 |
+| i003 | alpha | 99,901 | 716,043 |
+| i004 | grey | 98,310 | 740,322 |
+| i005 | flat | 15,029 | 796,636 |
+| i006 | rich | 171,047 | 717,928 |
 | i007 | alpha | 60,890 | 701,871 |
-| i008 | grey | 24,900 | 714,083 |
+| i008 | grey | 23,431 | 750,616 |
 
-**Total score 712,808** — against the house baseline fixed-paeth 1.0.0 at 420,399 on the same set, and the scale compressor's implied 666,667. All 8 instances answered in the stated format, every pixel exact. Total output for the set: 547,473 bytes.
+**Total score 743,298** — against the house baseline fixed-paeth 1.0.0 at 420,399 on the same set, and the scale compressor's implied 666,667. All 8 instances answered in the stated format, every pixel exact. Total output for the set: 528,470 bytes.
 
 ## Run it
 
@@ -42,7 +42,7 @@ Reads `/input/<id>/image.png`, writes `/output/<id>/image.png`. For local runs t
 ## Layout
 
 - `main.ts` — the entrypoint: PNG decode, analysis, colour-type forms, filter search, screening, PNG writing.
-- `deflate.ts` — the optimal-parsing DEFLATE encoder (plus its test exports).
+- `deflate3.ts` — the match-cache DEFLATE encoder.
 - `LICENSE` — MIT.
 
 ---

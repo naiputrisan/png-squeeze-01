@@ -3,14 +3,18 @@
 // Reads every /input/<id>/image.png, writes /output/<id>/image.png as the same
 // pixels in as few bytes as it can: colour-type reduction (palette / grey /
 // RGB / RGBA, with a tRNS key when one transparent value covers the image),
-// per-row filter search (fixed, minimum-sum, fewest-pairs and brute-force
-// trials weighed by zlib), and the best of two zlib level-9 encodings.
-// Pure Node built-ins only; no network, no clock, no environment reads, so
-// two runs on the same set write byte-identical files.
+// per-row filter search (fixed, minimum-sum and brute-force trials weighed
+// by zlib), and the best of two zlib level-9 encodings and a match-cache
+// DEFLATE encoder (deflate3.ts) whose shortest-path parse knows, at every
+// position, the closest distance for every match length. Pure Node
+// built-ins only and no network; the one clock read is the time guard in
+// encodeWinner(), which only ever downgrades the strong encoder on a run
+// that is far behind schedule, so a slow machine degrades to plain zlib
+// instead of timing out.
 import { inflateSync, deflateSync, constants } from 'node:zlib';
 import { mkdirSync, readdirSync, readFileSync, writeFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
-import { deflateOptimal } from './deflate.ts';
+import { deflateStrong } from './deflate3.ts';
 
 const INPUT = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
@@ -322,26 +326,12 @@ function signedSum(row: Uint8Array): number {
   return s;
 }
 
-// How many distinct neighbouring byte pairs a filtered row holds. Few pairs
-// means the row's bytes come from a small alphabet, which deflate likes.
-function pairsOf(row: Uint8Array, seen: Uint32Array, stamp: number): number {
-  let n = 0;
-  for (let i = 1; i < row.length; i++) {
-    const pair = (row[i - 1] << 8) | row[i];
-    if (seen[pair] !== stamp) {
-      seen[pair] = stamp;
-      n++;
-    }
-  }
-  return n;
-}
-
 // Filter every row of `samples` by `choice`: a fixed filter (0-4) for all
-// rows, or a per-row choice — 'minsum', 'pairs', or 'brute' (each filter
-// trial weighed by a zlib run over the trial row with the 32 KiB written
-// before it as the preset dictionary; the smallest trial wins, ties go to
-// the lower filter type).
-type FilterChoice = number | 'minsum' | 'pairs' | 'brute';
+// rows, or a per-row choice — 'minsum' or 'brute' (each filter trial
+// weighed by a zlib run over the trial row with the 32 KiB written before
+// it as the preset dictionary; the smallest trial wins, ties go to the
+// lower filter type).
+type FilterChoice = number | 'minsum' | 'brute';
 
 function filtered(
   samples: Uint8Array,
@@ -358,8 +348,6 @@ function filtered(
     row[0] = t;
     trial.push(row);
   }
-  const seen = new Uint32Array(65536);
-  let stamp = 0;
   for (let y = 0; y < height; y++) {
     const cur = samples.subarray(y * stride, (y + 1) * stride);
     const prev = y === 0 ? null : samples.subarray((y - 1) * stride, y * stride);
@@ -376,7 +364,6 @@ function filtered(
       filterRow(t, cur, prev, bpp, trial[t].subarray(1));
       let cost: number;
       if (choice === 'minsum') cost = signedSum(trial[t].subarray(1));
-      else if (choice === 'pairs') cost = pairsOf(trial[t].subarray(1), seen, ++stamp);
       else {
         cost =
           before.length === 0
@@ -439,7 +426,7 @@ function formsOf(rgba: Uint8Array): Form[] {
     samples: samplesOf(rgba, ct),
     plte: null,
     trns,
-    filters: [0, 1, 2, 4, 'minsum', 'pairs', 'brute'],
+    filters: [0, 'minsum', 'brute'],
   });
   return forms;
 }
@@ -461,22 +448,38 @@ interface Screened {
 
 // Screen every form and filter choice at zlib level 6 and keep the smallest
 // (first on a tie). Level 6 is a deliberate cheap proxy, not the final
-// encoding: the winner's filtered bytes are re-encoded at level 9 (and by
-// the optimal parser when the stream is large enough) by the caller, so
-// screening only has to rank the forms and filter choices, not produce the
-// bytes that ship. The winner's filtered bytes are then re-encoded at
-// level 9 by the caller.
+// encoding: the winner's filtered bytes are re-encoded at level 9 and by
+// the match-cache encoder by the caller, so screening only has to rank the
+// forms and filter choices, not produce the bytes that ship.
 function screen(rgba: Uint8Array, width: number, height: number): Screened {
-  let best: Screened | null = null;
+  // Tall images are first ranked on their first 180 rows only: filtering
+  // is row-local, so a form's filtered prefix is byte-identical to the
+  // full stream's prefix. A prefix ranking can mislead when an image's
+  // character changes down its height, so the three best prefix
+  // candidates are re-scored on the full stream and the winner is chosen
+  // from those full scores. Forms themselves (notably the palette) are
+  // always built from the whole image.
+  const trialHeight = height > 360 ? 180 : height;
+  const ranked: { form: Form; choice: FilterChoice; bytes: number }[] = [];
   for (const form of formsOf(rgba)) {
     const chunks = chunkBytes(form);
+    const rowBytes = width * form.bpp;
+    const trialSamples = form.samples.subarray(0, trialHeight * rowBytes);
     for (const choice of form.filters) {
-      const data = filtered(form.samples, width, height, form.bpp, choice);
+      const data = filtered(trialSamples, width, trialHeight, form.bpp, choice);
       const zlib = deflateSync(data, { level: 6, memLevel: 8 });
-      const bytes = zlib.length + chunks;
-      if (best === null || bytes < best.bytes) {
-        best = { form, choice, data, bytes };
-      }
+      ranked.push({ form, choice, bytes: zlib.length + chunks });
+    }
+  }
+  ranked.sort((a, b) => a.bytes - b.bytes);
+  const finalists = trialHeight < height ? ranked.slice(0, 3) : ranked.slice(0, 1);
+  let best: Screened | null = null;
+  for (const cand of finalists) {
+    const data = filtered(cand.form.samples, width, height, cand.form.bpp, cand.choice);
+    const zlib = deflateSync(data, { level: 6, memLevel: 8 });
+    const bytes = zlib.length + chunkBytes(cand.form);
+    if (best === null || bytes < best.bytes) {
+      best = { form: cand.form, choice: cand.choice, data, bytes };
     }
   }
   return best!;
@@ -528,31 +531,73 @@ function pngOf(width: number, height: number, form: Form, idat: Uint8Array): Uin
 }
 
 // ---- Entry ------------------------------------------------------------------
-// Compress one screenshot: screen its forms and filters, then encode the
-// winner's filtered bytes with the smallest of three zlib streams: the
-// optimal-parsing encoder, and zlib level 9 filtered and default. The
-// optimal parser throws on any inconsistency, in which case the two
-// platform streams are the whole choice.
-function compress(rgba: Uint8Array, width: number, height: number): Uint8Array {
-  const winner = screen(rgba, width, height);
+// The run's start, for the time guard in encodeWinner(): the grader gives
+// the whole set 60 seconds of wall time on one CPU. Images are encoded
+// cheapest-first (see the main loop), and before each strong encode the
+// guard estimates its cost from the stream length; a run that is behind
+// schedule downgrades or skips the strong encoder for the remaining —
+// most expensive, least rewarding — images, so a slow machine degrades
+// to plain zlib instead of timing out.
+const STARTED = Date.now();
+
+// Encode one screened winner: the smallest of the zlib level-9 filtered
+// stream and the match-cache encoder (deflate3.ts) at a tier matched to
+// the stream's size. The strong encoder throws on any inconsistency, in
+// which case the platform streams are the whole choice; it never loses to
+// plain zlib, because the platform stream is always a candidate.
+function encodeWinner(winner: Screened, width: number, height: number): Uint8Array {
   const z9f = deflateSync(winner.data, {
     level: 9,
     memLevel: 9,
     strategy: constants.Z_FILTERED,
   });
-  const z9d = deflateSync(winner.data, { level: 9, memLevel: 9 });
-  const candidates: Uint8Array[] = [z9f, z9d];
-  // The optimal parser earns its keep only on larger streams: on small
-  // ones (flat palettes, small greys) it matches zlib-9 within a few bytes
-  // while costing seconds, so it runs only when the platform streams are
-  // at least 30,000 bytes. The threshold is on size, not theme, so an
-  // unusually large flat or grey screenshot still gets the full treatment.
-  const smallest9 = Math.min(z9f.length, z9d.length);
-  if (smallest9 >= 30000) {
-    try {
-      candidates.push(deflateOptimal(winner.data));
-    } catch {
-      // Fall through to the platform encoders below.
+  const candidates: Uint8Array[] = [z9f];
+  const smallest9 = z9f.length;
+  if (smallest9 >= 4000) {
+    const len = winner.data.length;
+    let tier: { maxChain: number; passes: number; maxBlocks: number } | null;
+    if (len <= 1200000) {
+      tier = {
+        maxChain: winner.form.colourType === 3 ? 1024 : 512,
+        passes: 1,
+        maxBlocks: 10,
+      };
+    } else if (len <= 3000000) {
+      // A very large filtered stream that still compresses this well is
+      // mostly smooth gradient: the cache walk stops paying early, so a
+      // shorter chain loses almost nothing and saves seconds.
+      tier =
+        smallest9 >= 120000
+          ? { maxChain: 256, passes: 1, maxBlocks: 6 }
+          : { maxChain: 384, passes: 1, maxBlocks: 8 };
+    } else {
+      tier = { maxChain: 192, passes: 1, maxBlocks: 3 };
+    }
+    // Time guard: the strong encoder costs roughly a fixed number of
+    // microseconds per stream byte at one pass (measured: ~6.5 for
+    // 1-byte-per-pixel streams, whose matches run long; ~3.2 for RGB;
+    // ~2.6 for RGBA). If the estimate lands past the horizon, drop to
+    // the light tier; if even that lands past it, skip the strong
+    // encoder for this image.
+    const rate =
+      winner.form.bpp === 1 ? 0.0065 : winner.form.bpp === 3 ? 0.0032 : 0.0026;
+    const estMs = len * rate;
+    const elapsed = Date.now() - STARTED;
+    if (elapsed + estMs > 57500) {
+      tier = { maxChain: 192, passes: 1, maxBlocks: 3 };
+      if (elapsed + estMs * 0.6 > 57500) tier = null;
+    }
+    if (tier !== null) {
+      try {
+        candidates.push(deflateStrong(winner.data, tier));
+      } catch {
+        // Fall through to the platform encoders below.
+      }
+    } else {
+      // No time for the strong encoder: take the second platform stream
+      // as well, so the fallback is the better of the two zlib level-9
+      // encodings rather than one.
+      candidates.push(deflateSync(winner.data, { level: 9, memLevel: 9 }));
     }
   }
   let idat = candidates[0];
@@ -560,6 +605,11 @@ function compress(rgba: Uint8Array, width: number, height: number): Uint8Array {
   return pngOf(width, height, winner.form, idat);
 }
 
+// Decode and screen every image first, then encode cheapest-first:
+// one-byte-per-pixel streams encode fastest and gain the most per second,
+// the big RGBA streams gain the least per second, so if the time guard
+// ever has to degrade an image it degrades the one whose loss is smallest.
+const jobs: { id: string; winner: Screened; width: number; height: number }[] = [];
 for (const id of readdirSync(INPUT).sort()) {
   const dir = join(INPUT, id);
   let st;
@@ -574,6 +624,22 @@ for (const id of readdirSync(INPUT).sort()) {
   if (image.width !== WIDTH || image.height !== HEIGHT) {
     throw new Error(`${id}/image.png: ${image.width}x${image.height}, expected ${WIDTH}x${HEIGHT}`);
   }
-  mkdirSync(join(OUTPUT, id), { recursive: true });
-  writeFileSync(join(OUTPUT, id, 'image.png'), compress(image.rgba, image.width, image.height));
+  jobs.push({
+    id,
+    winner: screen(image.rgba, image.width, image.height),
+    width: image.width,
+    height: image.height,
+  });
+}
+jobs.sort(
+  (a, b) =>
+    a.winner.form.bpp - b.winner.form.bpp ||
+    a.winner.data.length - b.winner.data.length,
+);
+for (const job of jobs) {
+  mkdirSync(join(OUTPUT, job.id), { recursive: true });
+  writeFileSync(
+    join(OUTPUT, job.id, 'image.png'),
+    encodeWinner(job.winner, job.width, job.height),
+  );
 }
