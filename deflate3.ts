@@ -593,8 +593,8 @@ function buildCache(data: Uint8Array, maxChain: number): MatchCache {
   const head = new Int32Array(HASH_SIZE).fill(-1);
   const prev = new Int32Array(n);
   for (let i = 0; i < n; i++) {
+    const h = i + MIN_MATCH <= n ? hash3(data, i) : 0;
     if (i + MIN_MATCH <= n) {
-      const h = hash3(data, i);
       let j = head[h];
       const maxLen = Math.min(MAX_MATCH, n - i);
       const earliest = i - WINDOW;
@@ -631,7 +631,7 @@ function buildCache(data: Uint8Array, maxChain: number): MatchCache {
       count[i] = k;
     }
     if (i + 2 < n) {
-      const h = hash3(data, i);
+      const h = i + MIN_MATCH <= n ? hash3(data, i) : 0;
       prev[i] = head[h];
       head[h] = i;
     }
@@ -661,6 +661,21 @@ function dpParse(
     distCost[s] = distLen[s] > 0 ? distLen[s] : MAX_BITS;
     distExtraBits[s] = DIST_EXTRA[s];
   }
+  // Per-length match cost (length-symbol bits + extra bits), so the inner
+  // loop is a table lookup instead of a linear lenSymbolOf scan per step.
+  const lenCostOf = new Float64Array(259);
+  for (let l = 3; l <= MAX_MATCH; l++) {
+    const s = lenSymbolOf(l);
+    lenCostOf[l] = lenCost[s - 257] + lenExtraBits[s - 257];
+  }
+  // Per-distance match cost, same idea (distSymbolOf is a linear scan).
+  const distCostOf = new Float64Array(WINDOW + 1);
+  for (let d = 1; d <= WINDOW; d++) {
+    const s = distSymbolOf(d);
+    distCostOf[d] = distCost[s] + distExtraBits[s];
+  }
+  const isStep = new Uint8Array(259);
+  for (const s of LEN_STEPS) isStep[s] = 1;
   const cost = new Float64Array(n + 1).fill(Infinity);
   cost[0] = 0;
   const prevLen = new Int32Array(n + 1);
@@ -679,21 +694,18 @@ function dpParse(
     for (let c = 0; c < cnt; c++) {
       const mlen = cache.len[cb + c];
       const mdist = cache.dist[cb + c];
-      const dsym = distSymbolOf(mdist);
-      const dcost = distCost[dsym] + distExtraBits[dsym];
+      const dcost = distCostOf[mdist];
       for (const step of LEN_STEPS) {
         if (step > mlen) break;
-        const lsym = lenSymbolOf(step);
-        const cc = base + lenCost[lsym - 257] + lenExtraBits[lsym - 257] + dcost;
+        const cc = base + lenCostOf[step] + dcost;
         if (cc < cost[i + step]) {
           cost[i + step] = cc;
           prevLen[i + step] = step;
           prevDist[i + step] = mdist;
         }
       }
-      if (LEN_STEPS[LEN_STEPS.length - 1] < mlen || !LEN_STEPS.includes(mlen)) {
-        const lsym = lenSymbolOf(mlen);
-        const cc = base + lenCost[lsym - 257] + lenExtraBits[lsym - 257] + dcost;
+      if (!isStep[mlen]) {
+        const cc = base + lenCostOf[mlen] + dcost;
         if (cc < cost[i + mlen]) {
           cost[i + mlen] = cc;
           prevLen[i + mlen] = mlen;

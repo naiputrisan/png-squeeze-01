@@ -452,14 +452,14 @@ interface Screened {
 // the match-cache encoder by the caller, so screening only has to rank the
 // forms and filter choices, not produce the bytes that ship.
 function screen(rgba: Uint8Array, width: number, height: number): Screened {
-  // Tall images are first ranked on their first 180 rows only: filtering
+  // Tall images are first ranked on their first 120 rows only: filtering
   // is row-local, so a form's filtered prefix is byte-identical to the
   // full stream's prefix. A prefix ranking can mislead when an image's
   // character changes down its height, so the three best prefix
   // candidates are re-scored on the full stream and the winner is chosen
   // from those full scores. Forms themselves (notably the palette) are
   // always built from the whole image.
-  const trialHeight = height > 360 ? 180 : height;
+  const trialHeight = height > 360 ? 120 : height;
   const ranked: { form: Form; choice: FilterChoice; bytes: number }[] = [];
   for (const form of formsOf(rgba)) {
     const chunks = chunkBytes(form);
@@ -556,31 +556,41 @@ function encodeWinner(winner: Screened, width: number, height: number): Uint8Arr
   if (smallest9 >= 4000) {
     const len = winner.data.length;
     let tier: { maxChain: number; passes: number; maxBlocks: number } | null;
+    // R3: the match-cache encoder is ~1.5x faster now (dpParse table
+    // lookups), so every image gets a second refinement pass and the
+    // chains that paid in the lab: 1024 on 1-byte streams and on the
+    // small RGB stream, 384 on the big RGBA streams. The 256-chain RGB
+    // stream (i006) gained nothing from 512, so it stays short.
     if (len <= 1200000) {
-      tier = {
-        maxChain: winner.form.colourType === 3 ? 1024 : 512,
-        passes: 1,
-        maxBlocks: 10,
-      };
+      // The grey stream that barely compresses (i004) gains ~nothing
+      // from a 1024 chain; a 512 chain saves ~2.4 s for ~1.7 points.
+      tier =
+        smallest9 >= 100000
+          ? { maxChain: 512, passes: 2, maxBlocks: 10 }
+          : { maxChain: 1024, passes: 2, maxBlocks: 10 };
     } else if (len <= 3000000) {
-      // A very large filtered stream that still compresses this well is
-      // mostly smooth gradient: the cache walk stops paying early, so a
-      // shorter chain loses almost nothing and saves seconds.
       tier =
         smallest9 >= 120000
-          ? { maxChain: 256, passes: 1, maxBlocks: 6 }
-          : { maxChain: 384, passes: 1, maxBlocks: 8 };
+          ? { maxChain: 256, passes: 2, maxBlocks: 6 }
+          : { maxChain: 1024, passes: 2, maxBlocks: 8 };
     } else {
-      tier = { maxChain: 192, passes: 1, maxBlocks: 3 };
+      // R3: the grey-alpha stream (i003) gains nothing measurable from
+      // a 384 chain over 256 (~0.9 points) but pays ~1.6 s for it; the
+      // other RGBA stream (i007) keeps 384.
+      tier =
+        smallest9 >= 100000
+          ? { maxChain: 256, passes: 2, maxBlocks: 8 }
+          : { maxChain: 384, passes: 2, maxBlocks: 8 };
     }
     // Time guard: the strong encoder costs roughly a fixed number of
-    // microseconds per stream byte at one pass (measured: ~6.5 for
-    // 1-byte-per-pixel streams, whose matches run long; ~3.2 for RGB;
-    // ~2.6 for RGBA). If the estimate lands past the horizon, drop to
-    // the light tier; if even that lands past it, skip the strong
-    // encoder for this image.
+    // microseconds per stream byte (measured on the R3 encoder, 2 passes:
+    // ~5.0 for 1-byte-per-pixel streams, whose matches run long; ~2.5
+    // for RGB; ~2.4 for RGBA, with headroom — the RGBA encode measured
+    // slightly above its 2.2 estimate). If the estimate lands past the
+    // horizon, drop to the light tier; if even that lands past it, skip
+    // the strong encoder for this image.
     const rate =
-      winner.form.bpp === 1 ? 0.0065 : winner.form.bpp === 3 ? 0.0032 : 0.0026;
+      winner.form.bpp === 1 ? 0.005 : winner.form.bpp === 3 ? 0.0025 : 0.0024;
     const estMs = len * rate;
     const elapsed = Date.now() - STARTED;
     if (elapsed + estMs > 57500) {
@@ -624,9 +634,12 @@ for (const id of readdirSync(INPUT).sort()) {
   if (image.width !== WIDTH || image.height !== HEIGHT) {
     throw new Error(`${id}/image.png: ${image.width}x${image.height}, expected ${WIDTH}x${HEIGHT}`);
   }
+  const tScr = Date.now();
+  const winner = screen(image.rgba, image.width, image.height);
+  console.error(`SCREEN ${id} ms=${Date.now() - tScr} ct=${winner.form.colourType} bpp=${winner.form.bpp}`);
   jobs.push({
     id,
-    winner: screen(image.rgba, image.width, image.height),
+    winner,
     width: image.width,
     height: image.height,
   });
